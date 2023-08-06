@@ -427,19 +427,15 @@ def inference():
 
     vis_dims = [0, 1]
 
-    labels = data_labels.unique()
-    for l in labels:
-        index = data_labels == l
-        plt.scatter(pca_data[index, vis_dims[0]],
-                    pca_data[index, vis_dims[1]], label=l.item(), alpha=0.2, s=8)
+    for l in data_labels.unique():
+        plt.scatter(pca_data[data_labels == l, vis_dims[0]],
+                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
     plt.title("PCA values of different images")
     plt.scatter(fake_data[:, vis_dims[0]],
                 fake_data[:, vis_dims[1]], label="fake", alpha=0.2, s=8)
 
     plt.legend(loc='upper right')
     wandb.log({"distributions":  wandb.Image(plt)}, commit=False)
-    # os.makedirs(join(folder, "distribution"), exist_ok=True)
-    # plt.savefig(join(folder, "distribution", f'scatter_distribution_epoch_{epoch}.jpg'))
     plt.close()
     
     # plot density function approximation
@@ -451,40 +447,31 @@ def inference():
     #                    np.linspace(*data_ranges[vis_dims[1]], 100))
     # pos = np.dstack((x, y))
     # pdf_values = fitted_distribution.pdf(pos)
-    # plt.contourf(x, y, pdf_values, cmap='Reds', alpha=0.7)
+    # plt.contourf(x, y, pdf_values.T, cmap='Reds', alpha=0.7)
     # plt.title('2D Density Function of Fitted 2D Normal Distribution')
     # wandb.log({"dft_approx":  wandb.Image(plt)}, commit=False)
     # plt.close()
     
     # handmade hist for full control and contourf plot
     pdf_values, edges = np.histogramdd(sampled_data, range=[data_ranges[j] for j in vis_dims], density=True)
-    mid_points = [(e[1:]+e[:-1])/2 for e in edges]
-    x, y = np.meshgrid(*mid_points)
-    plt.contourf(x, y, pdf_values, cmap='Reds', alpha=0.7, origin='lower', 
+    plt.contourf(pdf_values.T, cmap='Reds', alpha=0.7, 
                  extent=[edges[0][0], edges[0][-1], edges[1][0], edges[1][-1]])
     plt.title('Density Function Contourf plot')
-    labels = data_labels.unique()
-    for l in labels:
-        index = data_labels == l
-        plt.scatter(pca_data[index, vis_dims[0]],
-                    pca_data[index, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
+    for l in data_labels.unique():
+        plt.scatter(pca_data[data_labels == l, vis_dims[0]],
+                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
     plt.legend(loc='upper right')
     wandb.log({"dft_contourf":  wandb.Image(plt)}, commit=False)
     plt.close()
     
-    
     plt.title('Density Function histogram plot')
     plt.hist2d(sampled_data[:, 0], sampled_data[:, 1], range=[data_ranges[j] for j in vis_dims], 
                alpha=0.7, cmap="Reds", bins=15)
-    labels = data_labels.unique()
-    for l in labels:
-        index = data_labels == l
-        plt.scatter(pca_data[index, vis_dims[0]],
-                    pca_data[index, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
+    for l in data_labels.unique():
+        plt.scatter(pca_data[data_labels == l, vis_dims[0]],
+                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
     plt.legend(loc='upper right')
     wandb.log({"dft_approx":  wandb.Image(plt)}, commit=False)
-    # os.makedirs(join(folder, "distribution"), exist_ok=True)
-    # plt.savefig(join(folder, "distribution", f'contour_distribution_epoch_{epoch}.jpg'))
     plt.close()
     # compute metrics
     metrics = {}
