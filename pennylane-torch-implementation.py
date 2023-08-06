@@ -23,13 +23,16 @@ import argparse
 # %%
 # parameters
 parser = argparse.ArgumentParser(
-    description='learns gan on mnist dataset compressed with pca')
+    description='learns gan on mnist dataset compressed with pca',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
 parser.add_argument(
     '--batch_size',type=int, default=10)
 parser.add_argument("--dimensions", type=int, default=4, 
                     help="dimension of pca compressed data")
-parser.add_argument("--epoch", type=int, default=1)
+parser.add_argument("--epoch", type=int, default=1, help="number of epochs to learn")
+parser.add_argument("--d_lr", type=float, default=1e-3, help="learning rate of the discriminator")
+parser.add_argument("--g_lr", type=float, default=1e-3, help="learning rate of the generator")
 parser.add_argument("--model",  type=str, choices=["q", "c"], default="q")
 
 config, unknown = parser.parse_known_args()
@@ -60,9 +63,9 @@ size_dataset = 1000
 data_dimensions = config.dimensions
 
 # Hyperparameters
-batch_size = 10
-g_lr = 1e-1
-d_lr = 1e-2
+batch_size = config.batch_size
+g_lr = config.g_lr
+d_lr = config.d_lr
 
 if config.model == "q":
     quantum = True
@@ -132,17 +135,13 @@ plt.close()
 # --------------------------------------------------
 # --------  Normalize vector components ------------
 # --------------------------------------------------
+# scale data to be in [-1, 1]
 pca_descaler = [[] for _ in range(k)]
 for i in range(k):
-    if pca_data[:, i].min() < 0:
-        pca_descaler[i].append(pca_data[:, i].min())
-        pca_data[:, i] += np.abs(pca_data[:, i].min())
-    else:
-        pca_descaler[i].append(pca_data[:, i].min())
-        pca_data[:, i] -= pca_data[:, i].min()
-    pca_descaler[i].append(pca_data[:, i].max())
-    pca_data[:, i] /= pca_data[:, i].max()
-
+    a, b = pca_data[:, i].min(), pca_data[:, i].max(), 
+    pca_descaler[i] = [(a+b)/2, (b-a)/2] # mean, scale
+    pca_data[:, i] -= pca_descaler[i][0]
+    pca_data[:, i] /= pca_descaler[i][1]
 
 train_dataset = pca_data
 
@@ -151,8 +150,6 @@ print(f"The Total Explained Variance of {k} Dimensions is {sum(pca.explained_var
 # --------------------------------------------------
 # Define a function that can take in PCA'ed data and return an image
 # --------------------------------------------------
-
-
 def descale_points(d_point, scales=pca_descaler, tfrm=pca):
     for col in range(d_point.shape[1]):
         d_point[:, col] *= scales[col][1]
@@ -267,7 +264,7 @@ else:
                 nn.Linear(hidden_size, hidden_size),
                 nn.LeakyReLU(0.02),
                 nn.Linear(hidden_size, image_size),
-                nn.Sigmoid()  # To ensure pixel values are in the range [0, 1]
+                nn.Tanh()  # To ensure pixel values are in the range [-1, 1]
             )
 
         def forward(self, x):
@@ -279,6 +276,10 @@ else:
             super(Discriminator, self).__init__()
             self.model = nn.Sequential(
                 nn.Linear(image_size, hidden_size),
+                nn.LeakyReLU(0.02),
+                nn.Linear(hidden_size, hidden_size),
+                nn.LeakyReLU(0.02),
+                nn.Linear(hidden_size, hidden_size),
                 nn.LeakyReLU(0.02),
                 nn.Linear(hidden_size, 1),
                 nn.Sigmoid()
@@ -395,7 +396,7 @@ def fit_epoch():
 
 def inference():
     # generate images
-    n_samples = 100
+    n_samples = 1000
     with torch.no_grad():
         fake_data = np.array(gen_data(get_latent(n_samples)))
 
@@ -404,7 +405,7 @@ def inference():
     os.makedirs(join(folder, "gen_images"), exist_ok=True)
     save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
                 join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
-    plt.figure(figsize=(1*n_visual, 1))
+    plt.figure(figsize=(2*n_visual, 2))
     for i in range(n_visual):
         plt.subplot(1, n_visual, i+1)
         plt.imshow(fake_images[i].view(28, 28), cmap='gray', vmin=0, vmax=1, interpolation="none")
