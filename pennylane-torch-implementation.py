@@ -11,6 +11,7 @@ from os.path import join
 import os
 
 from sklearn.decomposition import PCA
+from scipy.stats import multivariate_normal
 
 import torch
 import torchvision
@@ -110,7 +111,6 @@ valid_labels = (train_labels == 3) | (train_labels == 6) | (train_labels == 9)
 pca_data = pca_data[valid_labels][:size_dataset]
 data_labels = train_labels[valid_labels][:size_dataset]
 # %%
-# visualizing different dimensions reconstruction images
 n_images = 10
 
 plt.figure(figsize=(4*n_images, 4*2))
@@ -214,10 +214,9 @@ if quantum:
         qml.adjoint(discriminator)(d_params)
         return qml.expval(qml.Hermitian(projector, wires=range(n_qubits)))
 
-    # todo compare speed of this with:
         # return qml.probs(wires=range(n_qubits))
         # + take [0] element when using (but doesn't support adjoint diff)
-        # and so far thows error "QuantumFunctionError: Adjoint differentiation method does not support expectation return type mixed with other return types"
+        # and so far throws error "QuantumFunctionError: Adjoint differentiation method does not support expectation return type mixed with other return types"
 
     projector = torch.zeros((2**n_qubits, 2**n_qubits))
     projector[0, 0] = 1
@@ -336,6 +335,15 @@ data_ranges = list(zip(np.min(train_dataset, axis=0), np.max(train_dataset, axis
 
 true_dft = estimate_density(train_dataset) # for future computations
 
+def fit_multidimensional_normal(data):
+    # Compute the mean and covariance of the data
+    mean = np.mean(data, axis=0)
+    covariance_matrix = np.cov(data, rowvar=False)
+
+    # Create a multivariate normal distribution with the computed mean and covariance
+    fitted_distribution = multivariate_normal(mean=mean, cov=covariance_matrix)
+
+    return fitted_distribution
 # %% [markdown]
 # ## Learning
 
@@ -396,15 +404,15 @@ def fit_epoch():
 
 def inference():
     # generate images
-    n_samples = 1000
+    n_samples = 200
     with torch.no_grad():
         fake_data = np.array(gen_data(get_latent(n_samples)))
 
     n_visual = 10
     fake_images = torch.tensor(pca.inverse_transform(fake_data[:n_visual]), dtype=torch.float32)
-    os.makedirs(join(folder, "gen_images"), exist_ok=True)
-    save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
-                join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
+    # os.makedirs(join(folder, "gen_images"), exist_ok=True)
+    # save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
+    #             join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
     plt.figure(figsize=(2*n_visual, 2))
     for i in range(n_visual):
         plt.subplot(1, n_visual, i+1)
@@ -412,7 +420,7 @@ def inference():
         plt.axis('off')
     wandb.log({"generated_images": wandb.Image(plt)}, commit=False)
 
-    plt.savefig(join(folder, "gen_images", f'my_generated_images_epoch_{epoch}.jpg'))
+    # plt.savefig(join(folder, "gen_images", f'my_generated_images_epoch_{epoch}.jpg'))
     plt.close()
 
     # compare distributions on plot
@@ -430,8 +438,53 @@ def inference():
 
     plt.legend(loc='upper right')
     wandb.log({"distributions":  wandb.Image(plt)}, commit=False)
-    os.makedirs(join(folder, "distribution"), exist_ok=True)
-    plt.savefig(join(folder, "distribution", f'scatter_distribution_epoch_{epoch}.jpg'))
+    # os.makedirs(join(folder, "distribution"), exist_ok=True)
+    # plt.savefig(join(folder, "distribution", f'scatter_distribution_epoch_{epoch}.jpg'))
+    plt.close()
+    
+    # plot density function approximation
+    sampled_data = fake_data[:, vis_dims]
+    
+    # # normal distribution approximation
+    # fitted_distribution = fit_multidimensional_normal(sampled_data)
+    # x, y = np.meshgrid(np.linspace(*data_ranges[vis_dims[0]], 100), 
+    #                    np.linspace(*data_ranges[vis_dims[1]], 100))
+    # pos = np.dstack((x, y))
+    # pdf_values = fitted_distribution.pdf(pos)
+    # plt.contourf(x, y, pdf_values, cmap='Reds', alpha=0.7)
+    # plt.title('2D Density Function of Fitted 2D Normal Distribution')
+    # wandb.log({"dft_approx":  wandb.Image(plt)}, commit=False)
+    # plt.close()
+    
+    # handmade hist for full control and contourf plot
+    pdf_values, edges = np.histogramdd(sampled_data, range=[data_ranges[j] for j in vis_dims], density=True)
+    mid_points = [(e[1:]+e[:-1])/2 for e in edges]
+    x, y = np.meshgrid(*mid_points)
+    plt.contourf(x, y, pdf_values, cmap='Reds', alpha=0.7, origin='lower', 
+                 extent=[edges[0][0], edges[0][-1], edges[1][0], edges[1][-1]])
+    plt.title('Density Function Contourf plot')
+    labels = data_labels.unique()
+    for l in labels:
+        index = data_labels == l
+        plt.scatter(pca_data[index, vis_dims[0]],
+                    pca_data[index, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
+    plt.legend(loc='upper right')
+    wandb.log({"dft_contourf":  wandb.Image(plt)}, commit=False)
+    plt.close()
+    
+    
+    plt.title('Density Function histogram plot')
+    plt.hist2d(sampled_data[:, 0], sampled_data[:, 1], range=[data_ranges[j] for j in vis_dims], 
+               alpha=0.7, cmap="Reds", bins=15)
+    labels = data_labels.unique()
+    for l in labels:
+        index = data_labels == l
+        plt.scatter(pca_data[index, vis_dims[0]],
+                    pca_data[index, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
+    plt.legend(loc='upper right')
+    wandb.log({"dft_approx":  wandb.Image(plt)}, commit=False)
+    # os.makedirs(join(folder, "distribution"), exist_ok=True)
+    # plt.savefig(join(folder, "distribution", f'contour_distribution_epoch_{epoch}.jpg'))
     plt.close()
     # compute metrics
     metrics = {}
