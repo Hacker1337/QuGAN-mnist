@@ -29,12 +29,32 @@ parser.add_argument(
     '--batch_size',type=int, default=10)
 parser.add_argument("--dimensions", type=int, default=4, 
                     help="dimension of pca compressed data")
-parser.add_argument("--num_epochs", type=int, default=1)
-parser.add_argument("--model",  type=str, choices=["q", "c"])
+parser.add_argument("--epoch", type=int, default=1)
+parser.add_argument("--model",  type=str, choices=["q", "c"], default="q")
 
 config, unknown = parser.parse_known_args()
 if unknown:
     print("Warning, ignored unknown args:", *unknown)
+#%%
+# wandb
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv("wandb.env")
+wandb.login()
+
+wandb.init(
+    project="QuGAN-mnist",
+    # notes="",
+    config=config,
+    save_code=True,
+)
+# wandb.run.log_code(include_fn=lambda path: path.endswith("translate_train.ipynb"))
+# wandb.run.log_code(
+#     include_fn=lambda path: path.endswith(".ipynb") or path.endswith(".py")
+# )
+config = wandb.config
+
 # %%
 size_dataset = 1000
 data_dimensions = config.dimensions
@@ -222,6 +242,8 @@ if quantum:
     latent_size = n_qubits
     device = torch.device('cpu')
 
+    number_of_generator_params = g_params.numel()
+    number_of_discriminator_params = d_params.numel()
 ## %%
 # ### classical model
 else:
@@ -285,7 +307,33 @@ else:
 
     def gen_data(noise):
         return generator(noise)
+    
+    number_of_generator_params, number_of_discriminator_params = \
+    (sum(p.numel() for p in model.parameters() if p.requires_grad) 
+     for model in [generator, discriminator])
+    
+# %% some additional functions
 
+def kl_divergance(p, q):
+    eps = 0.1/p.size    # to be smaller, the uniform proba
+    p = np.maximum(eps, p)
+    p /= np.sum(p)
+    q = np.maximum(eps, q)
+    q /= np.sum(q)
+    return np.sum(p * np.log(p / q))
+
+def hellinger_distance(p, q):
+    pointwise_dist =  (np.sqrt(p) - np.sqrt(q))**2
+    return np.sqrt(np.sum(pointwise_dist)/2)
+
+def estimate_density(samples, bins=10):
+    # Compute the histogram of samples
+    hist, _ = np.histogramdd(samples, bins=bins, range=data_ranges)
+    return hist/len(samples)
+
+data_ranges = list(zip(np.min(train_dataset, axis=0), np.max(train_dataset, axis=0)))
+
+true_dft = estimate_density(train_dataset) # for future computations
 
 # %% [markdown]
 # ## Learning
@@ -295,6 +343,8 @@ else:
 criterion = torch.nn.BCELoss()
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
+wandb.run.summary["g_params"] = number_of_generator_params
+wandb.run.summary["d_params"] = number_of_discriminator_params
 
 def get_latent(size):
     return torch.randn(size, latent_size).to(device)
@@ -338,32 +388,35 @@ def fit_epoch():
 
         # Print progress
         if (i + 1) % log_step == 0:
-            print(f'Epoch [{epoch+1}/{config.num_epochs}], Step [{i+1}/{len(train_loader)}], '
+            print(f'Epoch [{epoch+1}/{config.epoch}], Step [{i+1}/{len(train_loader)}], '
                   f'Discriminator Loss: {d_loss.item():.4f}, Generator Loss: {g_loss.item():.4f}')
+            wandb.log({"d_loss": d_loss.item(), "g_loss": g_loss.item()})
 
 
 def inference():
     # generate images
-    with torch.no_grad():
-        fake_data = gen_data(get_latent(64))
-        fake_images = torch.tensor(pca.inverse_transform(fake_data), dtype=torch.float32)
-        os.makedirs(join(folder, "gen_images"), exist_ok=True)
-        save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
-                   join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
-        plt.figure(figsize=(4*10, 4))
-        for i in range(10):
-            plt.subplot(1, 10, i+1)
-            plt.imshow(fake_images[i].view(28, 28), cmap='gray', vmin=0, vmax=1, interpolation="none")
-            plt.axis('off')
-        plt.savefig(join(folder, "gen_images", f'my_generated_images_epoch_{epoch}.jpg'))
-        plt.close()
-
-    # compare distributions
-
-    vis_dims = [0, 1]
     n_samples = 100
     with torch.no_grad():
         fake_data = np.array(gen_data(get_latent(n_samples)))
+
+    n_visual = 10
+    fake_images = torch.tensor(pca.inverse_transform(fake_data[:n_visual]), dtype=torch.float32)
+    os.makedirs(join(folder, "gen_images"), exist_ok=True)
+    save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
+                join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
+    plt.figure(figsize=(1*n_visual, 1))
+    for i in range(n_visual):
+        plt.subplot(1, n_visual, i+1)
+        plt.imshow(fake_images[i].view(28, 28), cmap='gray', vmin=0, vmax=1, interpolation="none")
+        plt.axis('off')
+    wandb.log({"generated_images": wandb.Image(plt)}, commit=False)
+
+    plt.savefig(join(folder, "gen_images", f'my_generated_images_epoch_{epoch}.jpg'))
+    plt.close()
+
+    # compare distributions on plot
+
+    vis_dims = [0, 1]
 
     labels = data_labels.unique()
     for l in labels:
@@ -374,18 +427,31 @@ def inference():
     plt.scatter(fake_data[:, vis_dims[0]],
                 fake_data[:, vis_dims[1]], label="fake", alpha=0.2, s=8)
 
-    plt.legend()
+    plt.legend(loc='upper right')
+    wandb.log({"distributions":  wandb.Image(plt)}, commit=False)
     os.makedirs(join(folder, "distribution"), exist_ok=True)
     plt.savefig(join(folder, "distribution", f'scatter_distribution_epoch_{epoch}.jpg'))
     plt.close()
+    # compute metrics
+    metrics = {}
+    fake_dft = estimate_density(fake_data)
+    with torch.no_grad():
+        metrics["kl_divergence"] = kl_divergance(true_dft, fake_dft).item()
+        metrics["hellinger_distance"] = hellinger_distance(true_dft, fake_dft).item()
+        print("logging on epoch", epoch)
+        wandb.log(metrics, commit=False)
+    print(metrics)
+    
+    return metrics
 
 
 
 # Training loop
-for epoch in range(config.num_epochs):
+for epoch in range(config.epoch):
     start = time.time()
     # Save generated images each epoch
     inference()
+    
     print('Time for inference is {} sec'.format(time.time() - start))
 
     start = time.time()
@@ -402,11 +468,4 @@ if quantum:
 else:
     torch.save(generator.state_dict(), join(folder, 'generator_model.pth'))
     torch.save(discriminator.state_dict(), join(folder, 'discriminator_model.pth'))
-
-
-#%%
-# temp cell
-# counting kl divergence and heidegger distance
-
-
 
