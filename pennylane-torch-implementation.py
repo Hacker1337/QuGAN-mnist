@@ -36,6 +36,7 @@ parser.add_argument("--d_lr",        default=1e-3,  type=float, help="learning r
 parser.add_argument("--g_lr",        default=1e-3,  type=float, help="learning rate of the generator")
 parser.add_argument("--model",       default="q",   type=str, choices=["q", "c"], )
 parser.add_argument("--d_layers",    default=1,     type=int, help="Number of layers of quantum discriminator")
+parser.add_argument("--g_layers",    default=1,     type=int, help="Number of layers of quantum generator")
 parser.add_argument("--dataset_size",default=1000,  type=int,)
 
 params, unknown = parser.parse_known_args()
@@ -52,6 +53,7 @@ params.d_lr = 1e-2
 params.g_lr = 1e-2
 params.dimensions = 2
 params.d_layers = 1
+params.g_layers = 1
 interactive = True
 
 #%%
@@ -180,24 +182,24 @@ if quantum:
     use_noise = True
 
     dev = qml.device("lightning.qubit", wires=n_qubits)
+    shot_dev = qml.device("lightning.qubit", wires=n_qubits)
     diff_method = "adjoint"
 
-    d_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(3, n_qubits))
-                                ).requires_grad_(True)  # todo add multiple layers support
-    g_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(3, n_qubits))).requires_grad_(True)
+    d_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.d_layers, 3, n_qubits))).requires_grad_(True) 
+    g_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.g_layers, 3, n_qubits))).requires_grad_(True)
 
     def generator_circ(noise, params):
         if use_noise:
             for i in range(n_qubits):
                 qml.RX(noise[i], wires=i)
 
-        params = params.reshape(-1, n_qubits)
-        for i in range(n_qubits):
-            qml.RY(params[0, i], wires=i)
-        for i in range(n_qubits):
-            qml.IsingYY(params[1, i], wires=[i, (i+1) % n_qubits])
-        for i in range(n_qubits):
-            qml.CRY(params[1, i], wires=[i, (i+1) % n_qubits])
+        for l in range(config.g_layers):
+            for i in range(n_qubits):
+                qml.RY(params[l, 0, i], wires=i)
+            for i in range(n_qubits):
+                qml.IsingYY(params[l, 1, i], wires=[i, (i+1) % n_qubits])
+            for i in range(n_qubits):
+                qml.CRY(params[l, 2, i], wires=[i, (i+1) % n_qubits])
         # todo try with different axes rotations
 
     def data_loading_circ(values):
@@ -207,18 +209,24 @@ if quantum:
             qml.RY(np.arccos(values[i]), wires=i)
 
     def discriminator(params):
-        for i in range(n_qubits):
-            qml.RY(params[0, i], wires=i)
-        for i in range(n_qubits):
-            qml.IsingYY(params[1, i], wires=[i, (i+1) % n_qubits])
-        for i in range(n_qubits):
-            qml.CRY(params[1, i], wires=[i, (i+1) % n_qubits])
+        for l in range(config.d_layers):
+            for i in range(n_qubits):
+                qml.RY(params[l, 0, i], wires=i)
+            for i in range(n_qubits):
+                qml.IsingYY(params[l, 1, i], wires=[i, (i+1) % n_qubits])
+            for i in range(n_qubits):
+                qml.CRY(params[l, 2, i], wires=[i, (i+1) % n_qubits])
 
     @qml.qnode(dev, diff_method=diff_method)
-    def sample(noise, params):
+    def latent_sample(noise, params):
         generator_circ(noise, params)
         return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-
+    
+    @qml.qnode(shot_dev,)
+    def quantum_sample(params):
+        generator_circ(None, params)
+        return qml.sample()
+    
     @qml.qnode(dev, diff_method=diff_method)
     def discriminate_generated_circ(input, real=True):
         if real:
@@ -244,7 +252,16 @@ if quantum:
         return torch.stack([discriminate_generated_circ(noise, real=False)[None] for noise in z]).type(z.dtype)
 
     def gen_data(noise):
-        return [sample(x, g_params) for x in noise]
+        if use_noise:
+            return [latent_sample(x, g_params) for x in noise]
+        else:
+            shots = 20
+            shot_dev.shots = shots*noise.shape[0]
+            res = quantum_sample(g_params).reshape(shots, noise.shape[0], n_qubits) \
+                .float().mean(axis=0)
+            res = res*2 - 1  # from [0, 1] to [-1, 1]
+            return res
+            
 
     d_optimizer = optim.Adam([d_params], lr=d_lr)
     g_optimizer = optim.Adam([g_params], lr=g_lr)
@@ -368,8 +385,6 @@ def full_frame(width=None, height=None):
     """helper function to plot without axis and margins"""
     import matplotlib as mpl
     mpl.rcParams['savefig.pad_inches'] = 0
-    figsize = None if width is None else (width, height)
-    fig = plt.figure(figsize=figsize)
     ax = plt.axes([0,0,1,1], frameon=False)
     ax.get_xaxis().set_visible(False)
     ax.get_yaxis().set_visible(False)
@@ -429,13 +444,13 @@ def fit_epoch():
         # Print progress
         if (i + 1) % log_step == 0:
             print(f'Epoch [{epoch+1}/{config.epoch}], Step [{i+1}/{len(train_loader)}], '
-                  f'Discriminator Loss: {d_loss.item():.4f}, Generator Loss: {g_loss.item():.4f}')
+                  f'Discr Loss: {d_loss.item():.4f}, Gen Loss: {g_loss.item():.4f}')
             wandb.log({"d_loss": d_loss.item(), "g_loss": g_loss.item()})
 
 
 def inference():
     # generate images
-    if quantum:
+    if quantum and use_noise:
         n_samples = 200
     else:
         n_samples = 2000
@@ -444,20 +459,20 @@ def inference():
     with torch.no_grad():
         fake_data = np.array(gen_data(get_latent(n_samples)))
 
-    n_visual = 10
-    fake_images = torch.tensor(pca.inverse_transform(fake_data[:n_visual]), dtype=torch.float32)
-    # os.makedirs(join(folder, "gen_images"), exist_ok=True)
-    # save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
-    #             join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
-    plt.figure(figsize=(2*n_visual, 2))
-    for i in range(n_visual):
-        plt.subplot(1, n_visual, i+1)
-        plt.imshow(fake_images[i].view(28, 28), cmap='gray', vmin=0, vmax=1, interpolation="none")
-        plt.axis('off')
-    wandb.log({"generated_images": wandb.Image(plt)}, commit=False)
+    # n_visual = 10
+    # fake_images = torch.tensor(pca.inverse_transform(fake_data[:n_visual]), dtype=torch.float32)
+    # # os.makedirs(join(folder, "gen_images"), exist_ok=True)
+    # # save_image(fake_images.view(fake_images.size(0), 1, 28, 28),
+    # #             join(folder, "gen_images", f'generated_images_epoch_{epoch}.jpg'))
+    # plt.figure(figsize=(2*n_visual, 2))
+    # for i in range(n_visual):
+    #     plt.subplot(1, n_visual, i+1)
+    #     plt.imshow(fake_images[i].view(28, 28), cmap='gray', vmin=0, vmax=1, interpolation="none")
+    #     plt.axis('off')
+    # wandb.log({"generated_images": wandb.Image(plt)}, commit=False)
 
-    # plt.savefig(join(folder, "gen_images", f'my_generated_images_epoch_{epoch}.jpg'))
-    plt.close()
+    # # plt.savefig(join(folder, "gen_images", f'my_generated_images_epoch_{epoch}.jpg'))
+    # plt.close()
 
     # compare distributions on plot
 
