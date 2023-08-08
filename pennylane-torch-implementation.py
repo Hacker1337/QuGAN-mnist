@@ -31,14 +31,29 @@ parser.add_argument(
     '--batch_size',type=int, default=10)
 parser.add_argument("--dimensions", type=int, default=4, 
                     help="dimension of pca compressed data")
-parser.add_argument("--epoch", type=int, default=1, help="number of epochs to learn")
-parser.add_argument("--d_lr", type=float, default=1e-3, help="learning rate of the discriminator")
-parser.add_argument("--g_lr", type=float, default=1e-3, help="learning rate of the generator")
-parser.add_argument("--model",  type=str, choices=["q", "c"], default="q")
+parser.add_argument("--epoch",       default=1,     type=int, help="number of epochs to learn")
+parser.add_argument("--d_lr",        default=1e-3,  type=float, help="learning rate of the discriminator")
+parser.add_argument("--g_lr",        default=1e-3,  type=float, help="learning rate of the generator")
+parser.add_argument("--model",       default="q",   type=str, choices=["q", "c"], )
+parser.add_argument("--d_layers",    default=1,     type=int, help="Number of layers of quantum discriminator")
+parser.add_argument("--dataset_size",default=1000,  type=int,)
 
-config, unknown = parser.parse_known_args()
+params, unknown = parser.parse_known_args()
 if unknown:
     print("Warning, ignored unknown args:", *unknown)
+interactive = False
+params.dataset_size = min(60_000, params.dataset_size)
+
+#%% 
+# handmade parameter adjust
+params.epoch = 100
+params.model = "q"
+params.d_lr = 1e-2
+params.g_lr = 1e-2
+params.dimensions = 2
+params.d_layers = 1
+interactive = True
+
 #%%
 # wandb
 import wandb
@@ -49,8 +64,8 @@ wandb.login()
 
 wandb.init(
     project="QuGAN-mnist",
-    # notes="",
-    config=config,
+    notes="",
+    config=params,
     save_code=True,
 )
 # wandb.run.log_code(include_fn=lambda path: path.endswith("translate_train.ipynb"))
@@ -60,7 +75,6 @@ wandb.init(
 config = wandb.config
 
 # %%
-size_dataset = 1000
 data_dimensions = config.dimensions
 
 # Hyperparameters
@@ -108,8 +122,8 @@ pca_data = pca.transform(train_images).astype(np.float32)
 
 valid_labels = (train_labels == 3) | (train_labels == 6) | (train_labels == 9)
 
-pca_data = pca_data[valid_labels][:size_dataset]
-data_labels = train_labels[valid_labels][:size_dataset]
+pca_data = pca_data[valid_labels][:config.dataset_size]
+data_labels = train_labels[valid_labels][:config.dataset_size]
 # %%
 n_images = 10
 
@@ -250,19 +264,15 @@ else:
 
     # Hyperparameters
     image_size = data_dimensions
-    latent_size = 10
-    hidden_size = 10
+    latent_size = 4
+    hidden_size = 4
 
     # Generator model
     class Generator(nn.Module):
         def __init__(self):
             super(Generator, self).__init__()
             self.model = nn.Sequential(
-                nn.Linear(latent_size, hidden_size),
-                nn.LeakyReLU(0.02),
-                nn.Linear(hidden_size, hidden_size),
-                nn.LeakyReLU(0.02),
-                nn.Linear(hidden_size, image_size),
+                nn.Linear(latent_size, image_size),
                 nn.Tanh()  # To ensure pixel values are in the range [-1, 1]
             )
 
@@ -322,6 +332,15 @@ def kl_divergance(p, q):
     q /= np.sum(q)
     return np.sum(p * np.log(p / q))
 
+def fake_hellinger_distance(p: np.array, q: np.array):
+    results = []
+    n = len(p.shape)
+    for i in range(n):
+        prior_p = np.sum(p, axis=tuple(range(i)) + tuple(range(i+1, n)))
+        prior_q = np.sum(q, axis=tuple(range(i)) + tuple(range(i+1, n)))
+        results.append(hellinger_distance(prior_p, prior_q))
+    return np.mean(results)
+
 def hellinger_distance(p, q):
     pointwise_dist =  (np.sqrt(p) - np.sqrt(q))**2
     return np.sqrt(np.sum(pointwise_dist)/2)
@@ -344,6 +363,18 @@ def fit_multidimensional_normal(data):
     fitted_distribution = multivariate_normal(mean=mean, cov=covariance_matrix)
 
     return fitted_distribution
+
+def full_frame(width=None, height=None):
+    """helper function to plot without axis and margins"""
+    import matplotlib as mpl
+    mpl.rcParams['savefig.pad_inches'] = 0
+    figsize = None if width is None else (width, height)
+    fig = plt.figure(figsize=figsize)
+    ax = plt.axes([0,0,1,1], frameon=False)
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+    plt.autoscale(tight=True)
+    
 # %% [markdown]
 # ## Learning
 
@@ -404,7 +435,12 @@ def fit_epoch():
 
 def inference():
     # generate images
-    n_samples = 200
+    if quantum:
+        n_samples = 200
+    else:
+        n_samples = 2000
+        
+    points_alpha = min(1, 0.2*1e3/config.dataset_size)
     with torch.no_grad():
         fake_data = np.array(gen_data(get_latent(n_samples)))
 
@@ -429,10 +465,10 @@ def inference():
 
     for l in data_labels.unique():
         plt.scatter(pca_data[data_labels == l, vis_dims[0]],
-                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
+                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=points_alpha, s=8)
     plt.title("PCA values of different images")
     plt.scatter(fake_data[:, vis_dims[0]],
-                fake_data[:, vis_dims[1]], label="fake", alpha=0.2, s=8)
+                fake_data[:, vis_dims[1]], label="fake", alpha=points_alpha, s=8)
 
     plt.legend(loc='upper right')
     wandb.log({"distributions":  wandb.Image(plt)}, commit=False)
@@ -453,33 +489,40 @@ def inference():
     # plt.close()
     
     # handmade hist for full control and contourf plot
+    full_frame()
     pdf_values, edges = np.histogramdd(sampled_data, range=[data_ranges[j] for j in vis_dims], density=True)
     plt.contourf(pdf_values.T, cmap='Reds', alpha=0.7, 
                  extent=[edges[0][0], edges[0][-1], edges[1][0], edges[1][-1]])
-    plt.title('Density Function Contourf plot')
+    # plt.title('Density Function Contourf plot')
     for l in data_labels.unique():
         plt.scatter(pca_data[data_labels == l, vis_dims[0]],
-                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
+                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=points_alpha, s=8)
     plt.legend(loc='upper right')
     wandb.log({"dft_contourf":  wandb.Image(plt)}, commit=False)
+    if interactive:
+        plt.show()
     plt.close()
     
-    plt.title('Density Function histogram plot')
-    plt.hist2d(sampled_data[:, 0], sampled_data[:, 1], range=[data_ranges[j] for j in vis_dims], 
-               alpha=0.7, cmap="Reds", bins=15)
-    for l in data_labels.unique():
-        plt.scatter(pca_data[data_labels == l, vis_dims[0]],
-                    pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=0.2, s=8)
-    plt.legend(loc='upper right')
-    wandb.log({"dft_approx":  wandb.Image(plt)}, commit=False)
-    plt.close()
+    # full_frame()
+    # # plt.title('Density Function histogram plot')
+    # plt.hist2d(sampled_data[:, 0], sampled_data[:, 1], range=[data_ranges[j] for j in vis_dims], 
+    #            alpha=0.7, cmap="Reds", bins=15)
+    # for l in data_labels.unique():
+    #     plt.scatter(pca_data[data_labels == l, vis_dims[0]],
+    #                 pca_data[data_labels == l, vis_dims[1]], label=l.item(), c='blue', alpha=points_alpha, s=8)
+    # plt.legend(loc='upper right')
+    # wandb.log({"dft_approx_hist":  wandb.Image(plt)}, commit=False)
+    # if interactive:
+    #     plt.show()
+    # plt.close()
+    
     # compute metrics
     metrics = {}
     fake_dft = estimate_density(fake_data)
     with torch.no_grad():
         metrics["kl_divergence"] = kl_divergance(true_dft, fake_dft).item()
         metrics["hellinger_distance"] = hellinger_distance(true_dft, fake_dft).item()
-        print("logging on epoch", epoch)
+        metrics["fake_hellinger_distance"] = fake_hellinger_distance(true_dft, fake_dft).item()
         wandb.log(metrics, commit=False)
     print(metrics)
     
@@ -510,3 +553,5 @@ else:
     torch.save(generator.state_dict(), join(folder, 'generator_model.pth'))
     torch.save(discriminator.state_dict(), join(folder, 'discriminator_model.pth'))
 
+# %%
+wandb.finish()
