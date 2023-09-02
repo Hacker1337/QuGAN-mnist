@@ -20,6 +20,8 @@ import torch.optim as optim
 from torchvision.utils import save_image
 
 import argparse
+torch.manual_seed(0)
+np.random.seed(1)
 
 # %%
 # parameters
@@ -29,12 +31,15 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument(
     '--batch_size',type=int, default=10)
-parser.add_argument("--dimensions", type=int, default=4, 
+parser.add_argument("--dimensions", type=int, default=4,
                     help="dimension of pca compressed data")
 parser.add_argument("--epoch",       default=1,     type=int, help="number of epochs to learn")
 parser.add_argument("--d_lr",        default=1e-3,  type=float, help="learning rate of the discriminator")
 parser.add_argument("--g_lr",        default=1e-3,  type=float, help="learning rate of the generator")
-parser.add_argument("--model",       default="q",   type=str, choices=["q", "c"], )
+parser.add_argument("--model",       default="q_exp",   type=str, choices=["q_exp", "q_sample", "c"],
+                    help="c -- classial GAN,\n" +
+                    "q_exp -- expectation value base quantum model with classical noise\n"+
+                    "q_sample -- quantum sample based model. Uses quantum randomness")
 parser.add_argument("--d_layers",    default=1,     type=int, help="Number of layers of quantum discriminator")
 parser.add_argument("--g_layers",    default=1,     type=int, help="Number of layers of quantum generator")
 parser.add_argument("--dataset_size",default=1000,  type=int,)
@@ -45,24 +50,25 @@ if unknown:
 interactive = False
 params.dataset_size = min(60_000, params.dataset_size)
 
-#%% 
-# handmade parameter adjust
-params.epoch = 100
-params.model = "q"
-params.d_lr = 1e-2
-params.g_lr = 1e-2
-params.dimensions = 2
-params.d_layers = 1
-params.g_layers = 1
-interactive = True
+# #%%
+# # handmade parameter adjust
+# params.epoch = 50
+# params.model = "q"
+# params.d_lr = 1e-2
+# params.g_lr = 0*1e-3
+# params.dimensions = 2
+# params.d_layers = 1
+# params.g_layers = 9
+# interactive = True
 
 #%%
 # wandb
 import wandb
 from dotenv import load_dotenv
+import os
 
 load_dotenv("wandb.env")
-wandb.login()
+wandb.login(key=os.environ["WANDB_API_KEY"])
 
 wandb.init(
     project="QuGAN-mnist",
@@ -84,11 +90,15 @@ batch_size = config.batch_size
 g_lr = config.g_lr
 d_lr = config.d_lr
 
-if config.model == "q":
+if config.model == "q_exp":
     quantum = True
+    use_noise = True
+elif config.model == "q_sample":
+    quantum = True
+    use_noise = False
 elif config.model == "c":
     quantum = False
-    
+
 # parameters
 log_step = 10
 
@@ -98,7 +108,7 @@ log_step = 10
 # create name for data folder
 
 time_stamp = datetime.now().strftime("%d.%m_%H:%M:%S")
-folder = join("logs", f'{"q" if quantum else "c"}GAN__d={data_dimensions}__{time_stamp}')
+folder = join("logs", f'{config.model}GAN__d={data_dimensions}__{time_stamp}')
 os.makedirs(folder)
 # %%
 transform = transforms.Compose([
@@ -154,7 +164,7 @@ plt.close()
 # scale data to be in [-1, 1]
 pca_descaler = [[] for _ in range(k)]
 for i in range(k):
-    a, b = pca_data[:, i].min(), pca_data[:, i].max(), 
+    a, b = pca_data[:, i].min(), pca_data[:, i].max(),
     pca_descaler[i] = [(a+b)/2, (b-a)/2] # mean, scale
     pca_data[:, i] -= pca_descaler[i][0]
     pca_data[:, i] /= pca_descaler[i][1]
@@ -174,19 +184,18 @@ def descale_points(d_point, scales=pca_descaler, tfrm=pca):
     return reconstruction
 
 
-# %% [markdown]
+# %%
 if quantum:
     # ### Pennylane quantum model
 
     n_qubits = data_dimensions
-    use_noise = True
 
     dev = qml.device("lightning.qubit", wires=n_qubits)
     shot_dev = qml.device("lightning.qubit", wires=n_qubits)
     diff_method = "adjoint"
 
-    d_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.d_layers, 3, n_qubits))).requires_grad_(True) 
     g_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.g_layers, 3, n_qubits))).requires_grad_(True)
+    d_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.d_layers, 3, n_qubits))).requires_grad_(True)
 
     def generator_circ(noise, params):
         if use_noise:
@@ -221,13 +230,13 @@ if quantum:
     def latent_sample(noise, params):
         generator_circ(noise, params)
         return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-    
+
     @qml.qnode(shot_dev,)
     def quantum_sample(params):
         generator_circ(None, params)
         return qml.sample()
-    
-    @qml.qnode(dev, diff_method=diff_method)
+
+    @qml.qnode(dev, diff_method=diff_method, interface="torch")
     def discriminate_generated_circ(input, real=True):
         if real:
             data_loading_circ(input)
@@ -243,7 +252,7 @@ if quantum:
     projector = torch.zeros((2**n_qubits, 2**n_qubits))
     projector[0, 0] = 1
 
-    def discim_real(data):
+    def discrim_real(data):
         '''generates probabilities of discriminating'''
         return torch.stack([discriminate_generated_circ(x, real=True)[None] for x in data]).type(data.dtype)
 
@@ -261,7 +270,7 @@ if quantum:
                 .float().mean(axis=0)
             res = res*2 - 1  # from [0, 1] to [-1, 1]
             return res
-            
+
 
     d_optimizer = optim.Adam([d_params], lr=d_lr)
     g_optimizer = optim.Adam([g_params], lr=g_lr)
@@ -326,7 +335,7 @@ else:
     d_optimizer = optim.Adam(discriminator.parameters(), lr=d_lr)
     g_optimizer = optim.Adam(generator.parameters(), lr=g_lr)
 
-    def discim_real(data):
+    def discrim_real(data):
         return discriminator(data)
 
     def discrim_fake(noise):
@@ -334,11 +343,11 @@ else:
 
     def gen_data(noise):
         return generator(noise)
-    
+
     number_of_generator_params, number_of_discriminator_params = \
-    (sum(p.numel() for p in model.parameters() if p.requires_grad) 
+    (sum(p.numel() for p in model.parameters() if p.requires_grad)
      for model in [generator, discriminator])
-    
+
 # %% some additional functions
 
 def kl_divergance(p, q):
@@ -362,6 +371,20 @@ def hellinger_distance(p, q):
     pointwise_dist =  (np.sqrt(p) - np.sqrt(q))**2
     return np.sqrt(np.sum(pointwise_dist)/2)
 
+def visualize_discriminator():
+    assert data_dimensions == 2
+    n = 10
+    x = np.linspace(*data_ranges[0], n, dtype=np.float32)
+    y = np.linspace(*data_ranges[1], n, dtype=np.float32)
+    grids = np.meshgrid(x, y)
+    grids = [t.reshape(-1, 1) for t in grids]
+    xy = np.concatenate(grids, axis=1)
+    with torch.no_grad():
+        z = discrim_real(torch.from_numpy(xy))
+    z = z.reshape((n, n))
+    full_frame()
+    plt.contourf(z.T, vmin=0, vmax=1, levels=12)
+
 def estimate_density(samples, bins=10):
     # Compute the histogram of samples
     hist, _ = np.histogramdd(samples, bins=bins, range=data_ranges)
@@ -381,7 +404,7 @@ def fit_multidimensional_normal(data):
 
     return fitted_distribution
 
-def full_frame(width=None, height=None):
+def full_frame():
     """helper function to plot without axis and margins"""
     import matplotlib as mpl
     mpl.rcParams['savefig.pad_inches'] = 0
@@ -389,7 +412,7 @@ def full_frame(width=None, height=None):
     ax.get_xaxis().set_visible(False)
     ax.get_yaxis().set_visible(False)
     plt.autoscale(tight=True)
-    
+
 # %% [markdown]
 # ## Learning
 
@@ -416,7 +439,7 @@ def fit_epoch():
 
         # Train the discriminator
         # Real images
-        outputs = discim_real(images)
+        outputs = discrim_real(images)
         d_loss_real = criterion(outputs, real_labels)
 
         # Fake images
@@ -454,7 +477,7 @@ def inference():
         n_samples = 200
     else:
         n_samples = 2000
-        
+
     points_alpha = min(1, 0.2*1e3/config.dataset_size)
     with torch.no_grad():
         fake_data = np.array(gen_data(get_latent(n_samples)))
@@ -488,13 +511,13 @@ def inference():
     plt.legend(loc='upper right')
     wandb.log({"distributions":  wandb.Image(plt)}, commit=False)
     plt.close()
-    
+
     # plot density function approximation
     sampled_data = fake_data[:, vis_dims]
-    
+
     # # normal distribution approximation
     # fitted_distribution = fit_multidimensional_normal(sampled_data)
-    # x, y = np.meshgrid(np.linspace(*data_ranges[vis_dims[0]], 100), 
+    # x, y = np.meshgrid(np.linspace(*data_ranges[vis_dims[0]], 100),
     #                    np.linspace(*data_ranges[vis_dims[1]], 100))
     # pos = np.dstack((x, y))
     # pdf_values = fitted_distribution.pdf(pos)
@@ -502,11 +525,11 @@ def inference():
     # plt.title('2D Density Function of Fitted 2D Normal Distribution')
     # wandb.log({"dft_approx":  wandb.Image(plt)}, commit=False)
     # plt.close()
-    
+
     # handmade hist for full control and contourf plot
     full_frame()
     pdf_values, edges = np.histogramdd(sampled_data, range=[data_ranges[j] for j in vis_dims], density=True)
-    plt.contourf(pdf_values.T, cmap='Reds', alpha=0.7, 
+    plt.contourf(pdf_values.T, cmap='Reds', alpha=0.7,
                  extent=[edges[0][0], edges[0][-1], edges[1][0], edges[1][-1]])
     # plt.title('Density Function Contourf plot')
     for l in data_labels.unique():
@@ -517,10 +540,10 @@ def inference():
     if interactive:
         plt.show()
     plt.close()
-    
+
     # full_frame()
     # # plt.title('Density Function histogram plot')
-    # plt.hist2d(sampled_data[:, 0], sampled_data[:, 1], range=[data_ranges[j] for j in vis_dims], 
+    # plt.hist2d(sampled_data[:, 0], sampled_data[:, 1], range=[data_ranges[j] for j in vis_dims],
     #            alpha=0.7, cmap="Reds", bins=15)
     # for l in data_labels.unique():
     #     plt.scatter(pca_data[data_labels == l, vis_dims[0]],
@@ -530,7 +553,16 @@ def inference():
     # if interactive:
     #     plt.show()
     # plt.close()
-    
+
+    if data_dimensions == 2:
+        # visualize discriminator thoughts
+        visualize_discriminator()
+        wandb.log({"disciminator_predictions":  wandb.Image(plt)}, commit=False)
+        if interactive:
+            plt.show()
+        plt.close()
+
+
     # compute metrics
     metrics = {}
     fake_dft = estimate_density(fake_data)
@@ -540,7 +572,7 @@ def inference():
         metrics["fake_hellinger_distance"] = fake_hellinger_distance(true_dft, fake_dft).item()
         wandb.log(metrics, commit=False)
     print(metrics)
-    
+
     return metrics
 
 
@@ -550,7 +582,7 @@ for epoch in range(config.epoch):
     start = time.time()
     # Save generated images each epoch
     inference()
-    
+
     print('Time for inference is {} sec'.format(time.time() - start))
 
     start = time.time()
