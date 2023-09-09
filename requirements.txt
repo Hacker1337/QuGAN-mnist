@@ -1,0 +1,8 @@
+wandb
+python-dotenv
+
+pennylane
+torch
+scikit-learn
+
+matplotlib

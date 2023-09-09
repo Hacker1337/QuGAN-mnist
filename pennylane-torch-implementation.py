@@ -5,7 +5,6 @@ from pennylane import numpy as np
 
 # %%
 import matplotlib.pyplot as plt
-import seaborn as sns
 import time
 from os.path import join
 import os
@@ -36,10 +35,15 @@ parser.add_argument("--dimensions", type=int, default=4,
 parser.add_argument("--epoch",       default=1,     type=int, help="number of epochs to learn")
 parser.add_argument("--d_lr",        default=1e-3,  type=float, help="learning rate of the discriminator")
 parser.add_argument("--g_lr",        default=1e-3,  type=float, help="learning rate of the generator")
-parser.add_argument("--model",       default="q_exp",   type=str, choices=["q_exp", "q_sample", "c"],
+parser.add_argument("--model",       default="q_exp",   type=str, choices=["q_exp", "q_sample", "c", "h_exp", "h_sample"],
                     help="c -- classial GAN,\n" +
                     "q_exp -- expectation value base quantum model with classical noise\n"+
-                    "q_sample -- quantum sample based model. Uses quantum randomness")
+                    "q_sample -- quantum sample based model. Uses quantum randomness\n"+
+                    "h_exp -- hybrid model. Quantum generator with exp_val measurement\n"+
+                    "    and classical discriminator\n"+
+                    "h_sample -- hybrid model. Quantum generator with sample output\n"+
+                    "    and classical discriminator"
+                    )
 parser.add_argument("--d_layers",    default=1,     type=int, help="Number of layers of quantum discriminator")
 parser.add_argument("--g_layers",    default=1,     type=int, help="Number of layers of quantum generator")
 parser.add_argument("--dataset_size",default=1000,  type=int,)
@@ -98,6 +102,14 @@ elif config.model == "q_sample":
     use_noise = False
 elif config.model == "c":
     quantum = False
+elif config.model == "h_exp":
+    use_noise = True
+    quantum = True
+elif config.model == "h_sample":
+    use_noise = False
+    quantum = True
+else:
+    print("Warning! No configurations for such model")
 
 # parameters
 log_step = 10
@@ -185,7 +197,117 @@ def descale_points(d_point, scales=pca_descaler, tfrm=pca):
 
 
 # %%
-if quantum:
+if params.model in ("h_sample", "h_exp"):
+    # ### Quantum generator, classical discriminator
+    n_qubits = data_dimensions
+
+    dev = qml.device("lightning.qubit", wires=n_qubits)
+    shot_dev = qml.device("lightning.qubit", wires=n_qubits)
+    diff_method = "adjoint"
+
+    g_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.g_layers, 3, n_qubits))).requires_grad_(True)
+
+    def generator_circ(noise, params):
+
+        for l in range(1):
+            for i in range(n_qubits):
+                qml.RY(params[l, 0, i], wires=i)
+            for i in range(n_qubits):
+                qml.IsingYY(params[l, 1, i], wires=[i, (i+1) % n_qubits])
+            for i in range(n_qubits):
+                qml.CRY(params[l, 2, i], wires=[i, (i+1) % n_qubits])
+
+        if use_noise:
+            for i in range(n_qubits):
+                qml.RX(noise[i], wires=i)
+
+        for l in range(1, config.g_layers):
+            for i in range(n_qubits):
+                qml.RY(params[l, 0, i], wires=i)
+            for i in range(n_qubits):
+                qml.IsingYY(params[l, 1, i], wires=[i, (i+1) % n_qubits])
+            for i in range(n_qubits):
+                qml.CRY(params[l, 2, i], wires=[i, (i+1) % n_qubits])
+        # todo try with different axes rotations
+
+
+
+    @qml.qnode(dev, diff_method=diff_method)
+    def latent_sample(noise, params):
+        generator_circ(noise, params)
+        return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+
+    @qml.qnode(shot_dev, diff_method="finite-diff", h=0.01)
+    def quantum_sample(params):
+        generator_circ(None, params)
+        return qml.sample()
+
+    def gen_data(noise):
+        if use_noise:
+            return torch.stack([torch.stack(latent_sample(x, g_params)) for x in noise]).float()
+        else:
+            shots = 20
+            shot_dev.shots = shots*noise.shape[0]
+            res = quantum_sample(g_params).reshape(shots, noise.shape[0], n_qubits) \
+                .float().mean(axis=0)
+            res = res*2 - 1  # from [0, 1] to [-1, 1]
+            return res
+
+
+    g_optimizer = optim.Adam([g_params], lr=g_lr)
+
+    latent_size = n_qubits
+    device = torch.device('cpu')
+
+    number_of_generator_params = g_params.numel()
+
+    ## classical discriminator
+
+    import torch.nn as nn
+
+    # Hyperparameters
+    image_size = data_dimensions
+    hidden_size = 8
+
+    # Discriminator model
+    class Discriminator(nn.Module):
+        def __init__(self):
+            super(Discriminator, self).__init__()
+            self.model = nn.Sequential(
+                nn.Linear(image_size, hidden_size),
+                nn.LeakyReLU(0.2),
+                nn.Linear(hidden_size, hidden_size),
+                nn.LeakyReLU(0.2),
+                nn.Linear(hidden_size, hidden_size),
+                nn.LeakyReLU(0.2),
+                nn.Linear(hidden_size, 1),
+                nn.Sigmoid()
+            )
+
+        def forward(self, x):
+            return self.model(x)
+
+        def predict_real(self, data):
+            return self.model(data)
+
+        def predict_fake(self, noise):
+            return self.model(self.gen(noise).detach())
+
+    # Initialize models and optimizers
+    discriminator = Discriminator().to(device)
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=d_lr)
+
+    def discrim_real(data):
+        return discriminator(data)
+
+    def discrim_fake(noise):
+        return discriminator(gen_data(noise))
+
+    number_of_discriminator_params, = \
+    (sum(p.numel() for p in model.parameters() if p.requires_grad)
+     for model in [discriminator])
+
+elif quantum:
     # ### Pennylane quantum model
 
     n_qubits = data_dimensions
@@ -198,11 +320,20 @@ if quantum:
     d_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.d_layers, 3, n_qubits))).requires_grad_(True)
 
     def generator_circ(noise, params):
+
+        for l in range(1):
+            for i in range(n_qubits):
+                qml.RY(params[l, 0, i], wires=i)
+            for i in range(n_qubits):
+                qml.IsingYY(params[l, 1, i], wires=[i, (i+1) % n_qubits])
+            for i in range(n_qubits):
+                qml.CRY(params[l, 2, i], wires=[i, (i+1) % n_qubits])
+
         if use_noise:
             for i in range(n_qubits):
                 qml.RX(noise[i], wires=i)
 
-        for l in range(config.g_layers):
+        for l in range(1, config.g_layers):
             for i in range(n_qubits):
                 qml.RY(params[l, 0, i], wires=i)
             for i in range(n_qubits):
@@ -383,7 +514,9 @@ def visualize_discriminator():
         z = discrim_real(torch.from_numpy(xy))
     z = z.reshape((n, n))
     full_frame()
-    plt.contourf(z.T, vmin=0, vmax=1, levels=12)
+    plt.contourf(z, vmin=0, vmax=1, levels=12)
+    cbar = plt.colorbar()
+    cbar.set_label('probability to be real')
 
 def estimate_density(samples, bins=10):
     # Compute the histogram of samples
@@ -592,13 +725,13 @@ for epoch in range(config.epoch):
 epoch+=1
 inference()
 
-# Save models
-if quantum:
-    torch.save(g_params, join(folder, 'generator_model.pth'))
-    torch.save(d_params, join(folder, 'discriminator_model.pth'))
-else:
-    torch.save(generator.state_dict(), join(folder, 'generator_model.pth'))
-    torch.save(discriminator.state_dict(), join(folder, 'discriminator_model.pth'))
+# # Save models
+# if quantum: # replace with universal try/catch block
+#     torch.save(g_params, join(folder, 'generator_model.pth'))
+#     torch.save(d_params, join(folder, 'discriminator_model.pth'))
+# else:
+#     torch.save(generator.state_dict(), join(folder, 'generator_model.pth'))
+#     torch.save(discriminator.state_dict(), join(folder, 'discriminator_model.pth'))
 
 # %%
 wandb.finish()
