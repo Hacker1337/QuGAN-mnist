@@ -47,6 +47,8 @@ parser.add_argument("--model",       default="q_exp",   type=str, choices=["q_ex
 parser.add_argument("--d_layers",    default=1,     type=int, help="Number of layers of quantum discriminator")
 parser.add_argument("--g_layers",    default=1,     type=int, help="Number of layers of quantum generator")
 parser.add_argument("--dataset_size",default=1000,  type=int,)
+parser.add_argument("--Finite_diff_step",default=0.1,  type=float, help="relevant only for h_sample model")
+parser.add_argument("--number_of_averaged_samples",default=20,  type=int, help="relevant only for h_sample model")
 
 params, unknown = parser.parse_known_args()
 if unknown:
@@ -206,7 +208,9 @@ if params.model in ("h_sample", "h_exp"):
     diff_method = "adjoint"
 
     g_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.g_layers, 3, n_qubits))).requires_grad_(True)
-
+    if config.model == "h_sample":
+        g_params.requires_grad = False
+    
     def generator_circ(noise, params):
 
         for l in range(1):
@@ -237,7 +241,7 @@ if params.model in ("h_sample", "h_exp"):
         generator_circ(noise, params)
         return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
 
-    @qml.qnode(shot_dev, diff_method="finite-diff", h=0.01)
+    @qml.qnode(shot_dev)
     def quantum_sample(params):
         generator_circ(None, params)
         return qml.sample()
@@ -246,11 +250,12 @@ if params.model in ("h_sample", "h_exp"):
         if use_noise:
             return torch.stack([torch.stack(latent_sample(x, g_params)) for x in noise]).float()
         else:
-            shots = 20
+            shots = config.number_of_averaged_samples
             shot_dev.shots = shots*noise.shape[0]
             res = quantum_sample(g_params).reshape(shots, noise.shape[0], n_qubits) \
                 .float().mean(axis=0)
-            res = res*2 - 1  # from [0, 1] to [-1, 1]
+            res = (res - 0.5)*12
+            # from [0, 1] to [min, max]
             return res
 
 
@@ -550,7 +555,7 @@ def full_frame():
 # ## Learning
 
 # %%
-# ----- Learning -------
+# ----- Learning functions -------
 criterion = torch.nn.BCELoss()
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
@@ -559,6 +564,37 @@ wandb.run.summary["d_params"] = number_of_discriminator_params
 
 def get_latent(size):
     return torch.randn(size, latent_size).to(device)
+
+def eval_gradients(batch_size, h):
+    global g_params
+    gradients = torch.zeros_like(g_params)
+
+    real_labels = torch.ones(batch_size, 1).to(device)
+    def eval_loss():
+        z = get_latent(batch_size)
+        outputs = discrim_fake(z)
+        g_loss = criterion(outputs, real_labels)
+        return g_loss
+
+    f0 = eval_loss()
+
+    for index in np.ndindex(g_params.shape):
+        # save old value in memory for the case of precision problems
+        old_value = g_params[index].detach().clone()
+        g_params[index] += h
+
+        f1 = eval_loss()
+        gradients[index] = (f1-f0)/h
+
+        g_params[index] = old_value
+
+    return gradients, f0
+
+def step_generator(lr, h, batch_size=10_000):
+    global g_params
+    gradients, loss = eval_gradients(batch_size, h)
+    g_params -= gradients*lr
+    return loss
 
 
 def fit_epoch():
@@ -588,19 +624,22 @@ def fit_epoch():
         d_optimizer.step()
 
         # Train the generator
-        z = get_latent(batch_size)
-        outputs = discrim_fake(z)   # todo check whether it is possible to reuse previous computation ouf this outputs
-        g_loss = criterion(outputs, real_labels)
+        if config.model in ("h_sample"):
+            g_loss = step_generator(g_lr, h=config.Finite_diff_step)
+        else:
+            z = get_latent(batch_size)
+            outputs = discrim_fake(z)
+            g_loss = criterion(outputs, real_labels)
 
-        # Backprop and optimize generator
-        g_optimizer.zero_grad()
-        g_loss.backward()
-        g_optimizer.step()
+            # Backprop and optimize generator
+            g_optimizer.zero_grad()
+            g_loss.backward()
+            g_optimizer.step()
 
         # Print progress
         if (i + 1) % log_step == 0:
             print(f'Epoch [{epoch+1}/{config.epoch}], Step [{i+1}/{len(train_loader)}], '
-                  f'Discr Loss: {d_loss.item():.4f}, Gen Loss: {g_loss.item():.4f}')
+                  f'Discr Loss: {d_loss.item():.4f} (r: {d_loss_real:.2f}, f: {d_loss_fake:.2f}), Gen Loss: {g_loss.item():.4f}')
             wandb.log({"d_loss": d_loss.item(), "g_loss": g_loss.item()})
 
 
@@ -710,6 +749,7 @@ def inference():
 
 
 
+# %%
 # Training loop
 for epoch in range(config.epoch):
     start = time.time()
@@ -735,3 +775,14 @@ inference()
 
 # %%
 wandb.finish()
+# %%
+# # Save models
+# torch.save(g_params, join(folder, 'generator_model.pth'))
+# torch.save(discriminator.state_dict(), join(folder, 'discriminator_model.pth'))
+# # %%
+# # Load models
+# folder = "logs/h_sampleGAN__d=2__09.09_16:20:13"
+# g_params = torch.load(join(folder, 'generator_model.pth'))
+# discriminator.load_state_dict(torch.load(join(folder, 'discriminator_model.pth')))
+# # %%
+# inference()
