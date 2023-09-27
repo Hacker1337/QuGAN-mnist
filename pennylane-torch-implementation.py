@@ -58,14 +58,29 @@ params.dataset_size = min(60_000, params.dataset_size)
 
 # #%%
 # # handmade parameter adjust
+# # # classical model
+# # params.model = "c"
+# # params.d_lr = 1e-3
+# # params.g_lr = 3e-4
+# # params.batch_size = 100
+# # params.dataset_size = 10_000
+
+# # hybrid model
+# params.model = "h_sample"
+# params.d_lr = 3e-2
+# params.g_lr = 2e-2
+# params.Finite_diff_step = 0.1
+# params.number_of_averaged_samples = 200
+# params.batch_size = 100
+# params.dataset_size = 1_000
+
+
 # params.epoch = 50
-# params.model = "q"
-# params.d_lr = 1e-2
-# params.g_lr = 0*1e-3
 # params.dimensions = 2
 # params.d_layers = 1
-# params.g_layers = 9
-# interactive = True
+# params.g_layers = 1
+# # interactive = True
+
 
 #%%
 # wandb
@@ -81,6 +96,8 @@ wandb.init(
     notes="",
     config=params,
     save_code=True,
+    dir="~/wandb_logs/",
+    # dir="../../../../../../../../../home/amir/wandb_logs/",
 )
 # wandb.run.log_code(include_fn=lambda path: path.endswith("translate_train.ipynb"))
 # wandb.run.log_code(
@@ -93,7 +110,7 @@ data_dimensions = config.dimensions
 
 # Hyperparameters
 batch_size = config.batch_size
-g_lr = config.g_lr
+g_lr = config.g_lr # todo remove this and replace variables in code
 d_lr = config.d_lr
 
 if config.model == "q_exp":
@@ -210,7 +227,7 @@ if params.model in ("h_sample", "h_exp"):
     g_params = torch.from_numpy(np.random.uniform(0, 2*np.pi, size=(config.g_layers, 3, n_qubits))).requires_grad_(True)
     if config.model == "h_sample":
         g_params.requires_grad = False
-    
+
     def generator_circ(noise, params):
 
         for l in range(1):
@@ -427,7 +444,7 @@ else:
     # Hyperparameters
     image_size = data_dimensions
     latent_size = 4
-    hidden_size = 4
+    hidden_size = 8
 
     # Generator model
     class Generator(nn.Module):
@@ -519,7 +536,7 @@ def visualize_discriminator():
         z = discrim_real(torch.from_numpy(xy))
     z = z.reshape((n, n))
     full_frame()
-    plt.contourf(z, vmin=0, vmax=1, levels=12)
+    plt.contourf(z, vmin=0, vmax=1, levels=25)
     cbar = plt.colorbar()
     cbar.set_label('probability to be real')
 
